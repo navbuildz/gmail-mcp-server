@@ -8,7 +8,7 @@ An open-source [Model Context Protocol (MCP)](https://modelcontextprotocol.io) s
 
 Works with **Claude**, **OpenClaw**, **Cursor**, **Windsurf**, **Cline**, **Continue**, and any MCP-compatible client.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/new?referralCode=)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/navbuildz/gmail-mcp-server)
 
 ---
 
