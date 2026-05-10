@@ -105,6 +105,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `GOOGLE_CLIENT_SECRET` | Your OAuth Client Secret |
 | `ENCRYPTION_KEY` | Any random string (32+ characters) |
 | `ADMIN_PASSWORD` | Password for the setup page |
+| `MCP_AUTH_TOKEN` | Bearer token required on `/mcp` (strongly recommended for any public deploy — see [Securing the /mcp endpoint](#securing-the-mcp-endpoint)). Generate with `openssl rand -base64 48`. |
 | `SERVER_URL` | Your Railway app URL (e.g., `https://your-app.railway.app`) |
 | `PORT` | `3000` |
 
@@ -157,6 +158,7 @@ docker run -p 3000:3000 \
    - **Name**: `Gmail` (or any name you prefer)
    - **Remote MCP server URL**: `https://your-server-url/mcp`
    - Leave OAuth fields blank
+   - If `MCP_AUTH_TOKEN` is set on the server, add a custom header: `Authorization: Bearer <your-token>`
 4. Click **Add**
 5. Start a new conversation and try: *"List my connected Gmail accounts"*
 
@@ -170,11 +172,16 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
 {
   "mcpServers": {
     "gmail": {
-      "url": "https://your-server-url/mcp"
+      "url": "https://your-server-url/mcp",
+      "headers": {
+        "Authorization": "Bearer your-mcp-auth-token"
+      }
     }
   }
 }
 ```
+
+Omit the `headers` block if `MCP_AUTH_TOKEN` is not set on the server.
 
 ---
 
@@ -260,7 +267,23 @@ Gmail API (per-account OAuth tokens)
 - **Minimal scopes** using only `gmail.readonly` and `gmail.modify`
 - **No passwords stored.** Your Gmail password never touches the server
 - **Password-protected setup.** The `/setup` page requires admin authentication
+- **Bearer-token auth on the `/mcp` endpoint** when `MCP_AUTH_TOKEN` is set (see below)
 - **Revocable anytime** from [Google Account Permissions](https://myaccount.google.com/permissions)
+
+### Securing the `/mcp` endpoint
+
+When deployed publicly (e.g. on Railway), the `/mcp` endpoint is internet-reachable. Anyone who discovers the URL can call its tools — and those tools have access to every Gmail account connected via `/setup`.
+
+Set the `MCP_AUTH_TOKEN` environment variable to require a Bearer token on every `/mcp` request:
+
+```bash
+# Generate a strong token
+openssl rand -base64 48
+```
+
+When `MCP_AUTH_TOKEN` is set, callers must send `Authorization: Bearer <token>` on every `/mcp` request — requests without the header (or with the wrong token) get a 401. Your MCP client (Claude, Cursor, Windsurf, etc.) must be configured with the same token in its connector headers.
+
+When `MCP_AUTH_TOKEN` is unset, the server logs a stark warning at startup and accepts unauthenticated requests. This is only safe behind a private network, VPN, or auth proxy (Cloudflare Access, etc.). For any public deployment, set the token.
 
 ---
 
