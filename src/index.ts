@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { google } from "googleapis";
 import { z } from "zod";
+import { timingSafeEqual } from "node:crypto";
 import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
 
@@ -15,6 +16,7 @@ const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
@@ -346,6 +348,42 @@ app.use(express.urlencoded({ extended: true }));
 // Admin auth middleware for /setup routes
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MCP auth middleware — Bearer token check on /mcp routes
+// ---------------------------------------------------------------------------
+
+function requireMcpAuth(req: Request, res: Response, next: NextFunction): void {
+  if (!MCP_AUTH_TOKEN) {
+    next();
+    return;
+  }
+
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer ")) {
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized: missing Bearer token" },
+      id: null,
+    });
+    return;
+  }
+
+  const provided = header.slice("Bearer ".length);
+  const expected = MCP_AUTH_TOKEN;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized: invalid Bearer token" },
+      id: null,
+    });
+    return;
+  }
+
+  next();
+}
+
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const key =
     req.query.key as string | undefined ??
@@ -541,7 +579,7 @@ app.get("/health", (_req, res) => {
 // MCP transport — Streamable HTTP (stateless: each request gets a fresh server)
 // ---------------------------------------------------------------------------
 
-app.post("/mcp", async (req: Request, res: Response) => {
+app.post("/mcp", requireMcpAuth, async (req: Request, res: Response) => {
   try {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless — no session tracking
@@ -569,7 +607,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp", requireMcpAuth, async (req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "SSE streams not supported in stateless mode. Use POST." },
@@ -577,7 +615,7 @@ app.get("/mcp", async (req: Request, res: Response) => {
   });
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete("/mcp", requireMcpAuth, async (req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "Session management not used in stateless mode." },
@@ -595,4 +633,14 @@ app.listen(PORT, () => {
   console.log(`  Setup page:    ${SERVER_URL}/setup`);
   console.log(`  Health check:  ${SERVER_URL}/health`);
   console.log(`  Accounts:      ${tokenStore.size}`);
+  if (MCP_AUTH_TOKEN) {
+    console.log(`  MCP auth:      Bearer token required`);
+  } else {
+    console.warn(
+      "\n  ⚠  WARNING: MCP_AUTH_TOKEN is not set — /mcp endpoint is open to any caller.\n" +
+        "     Anyone who reaches this URL can query every connected Gmail account.\n" +
+        "     Set MCP_AUTH_TOKEN to a strong random value before deploying publicly.\n" +
+        "     Generate one with: openssl rand -base64 48\n"
+    );
+  }
 });
