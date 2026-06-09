@@ -325,6 +325,19 @@ export class GmailService {
   }
 
   // -----------------------------------------------------------------------
+// get_attachment — download attachment bytes as base64
+// -----------------------------------------------------------------------
+
+async getAttachment(messageId: string, attachmentId: string): Promise<string> {
+  const res = await this.gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId: messageId,
+    id: attachmentId,
+  });
+  return res.data.data ?? "";
+}
+
+  // -----------------------------------------------------------------------
   // Helpers
   // -----------------------------------------------------------------------
 
