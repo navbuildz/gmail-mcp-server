@@ -5,3 +5,5 @@ data/
 *.log
 .vercel
 .secrets.local
+RESUME_HERE.md
+CLAUDE.md
