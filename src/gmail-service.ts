@@ -28,6 +28,29 @@ export interface EmailDetail {
   unsubscribeLinks: string[];
 }
 
+export interface ComposeInput {
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject?: string;
+  body: string;
+  htmlBody?: string;
+  /** Reply in the thread of this message: sets threading headers, Re: subject and default recipient. */
+  replyToMessageId?: string;
+  /** Reply to the sender and everyone else on the original (minus yourself). */
+  replyAll?: boolean;
+}
+
+export interface ComposeResult {
+  id: string;
+  threadId: string;
+  draftId?: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+}
+
 export interface UnsubscribeResult {
   success: boolean;
   method: "header-mailto" | "header-http" | "body-link" | "none";
@@ -314,6 +337,138 @@ export class GmailService {
   }
 
   // -----------------------------------------------------------------------
+  // create_draft / send_email
+  // -----------------------------------------------------------------------
+
+  async createDraft(input: ComposeInput): Promise<ComposeResult> {
+    const { raw, threadId, meta } = await this.buildMessage(input);
+    const res = await this.gmail.users.drafts.create({
+      userId: "me",
+      requestBody: { message: { raw, threadId } },
+    });
+    return {
+      id: res.data.message?.id ?? "",
+      threadId: res.data.message?.threadId ?? "",
+      draftId: res.data.id ?? undefined,
+      ...meta,
+    };
+  }
+
+  async sendEmail(input: ComposeInput): Promise<ComposeResult> {
+    const { raw, threadId, meta } = await this.buildMessage(input);
+    const res = await this.gmail.users.messages.send({
+      userId: "me",
+      requestBody: { raw, threadId },
+    });
+    return { id: res.data.id ?? "", threadId: res.data.threadId ?? "", ...meta };
+  }
+
+  /** Sends an existing draft exactly as it is saved in Gmail. */
+  async sendDraft(draftId: string): Promise<ComposeResult> {
+    const draft = await this.gmail.users.drafts.get({ userId: "me", id: draftId, format: "metadata" });
+    const hdrs = draft.data.message?.payload?.headers ?? [];
+    const h = (n: string) => hdrs.find((x) => x.name?.toLowerCase() === n.toLowerCase())?.value ?? "";
+    const res = await this.gmail.users.drafts.send({ userId: "me", requestBody: { id: draftId } });
+    return {
+      id: res.data.id ?? "",
+      threadId: res.data.threadId ?? "",
+      draftId,
+      to: splitAddresses(h("To")),
+      cc: splitAddresses(h("Cc")),
+      bcc: splitAddresses(h("Bcc")),
+      subject: h("Subject"),
+    };
+  }
+
+  private async buildMessage(input: ComposeInput): Promise<{
+    raw: string;
+    threadId?: string;
+    meta: Omit<ComposeResult, "id" | "threadId" | "draftId">;
+  }> {
+    let to = clean(input.to);
+    let cc = clean(input.cc);
+    const bcc = clean(input.bcc);
+    let subject = input.subject ?? "";
+    let threadId: string | undefined;
+    const extra: string[] = [];
+
+    if (input.replyToMessageId) {
+      const orig = await this.gmail.users.messages.get({
+        userId: "me",
+        id: input.replyToMessageId,
+        format: "metadata",
+        metadataHeaders: ["Subject", "From", "Reply-To", "To", "Cc", "Message-ID", "References"],
+      });
+      const hdrs = orig.data.payload?.headers ?? [];
+      const h = (n: string) => hdrs.find((x) => x.name?.toLowerCase() === n.toLowerCase())?.value ?? "";
+      threadId = orig.data.threadId ?? undefined;
+      const messageId = h("Message-ID");
+      if (messageId) {
+        extra.push(`In-Reply-To: ${messageId}`);
+        extra.push(`References: ${[h("References"), messageId].filter(Boolean).join(" ")}`);
+      }
+      if (!subject) {
+        const s = h("Subject");
+        subject = /^re:/i.test(s) ? s : `Re: ${s}`;
+      }
+      if (to.length === 0) {
+        to = splitAddresses(h("Reply-To") || h("From"));
+        if (input.replyAll) {
+          const me = (await this.gmail.users.getProfile({ userId: "me" })).data.emailAddress?.toLowerCase() ?? "";
+          const seen = new Set(to.map(bareAddress));
+          const others = [...splitAddresses(h("To")), ...splitAddresses(h("Cc"))].filter((a) => {
+            const b = bareAddress(a);
+            if (b === me || seen.has(b)) return false;
+            seen.add(b);
+            return true;
+          });
+          cc = [...cc, ...others];
+        }
+      }
+    }
+
+    if (to.length + cc.length + bcc.length === 0) {
+      throw new Error("No recipients. Pass 'to' (or reply_to_message_id to answer the sender).");
+    }
+    for (const v of [...to, ...cc, ...bcc, subject]) {
+      if (/[\r\n]/.test(v)) throw new Error("Recipients and subject cannot contain line breaks.");
+    }
+
+    const headers = [
+      ...(to.length ? [`To: ${to.join(", ")}`] : []),
+      ...(cc.length ? [`Cc: ${cc.join(", ")}`] : []),
+      ...(bcc.length ? [`Bcc: ${bcc.join(", ")}`] : []),
+      `Subject: ${encodeHeader(subject)}`,
+      "MIME-Version: 1.0",
+      ...extra,
+    ];
+
+    let mime: string;
+    if (input.htmlBody) {
+      const boundary = `b_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+      mime = [
+        ...headers,
+        `Content-Type: multipart/alternative; boundary="${boundary}"`,
+        "",
+        `--${boundary}`,
+        ...textPart("text/plain", input.body),
+        `--${boundary}`,
+        ...textPart("text/html", input.htmlBody),
+        `--${boundary}--`,
+        "",
+      ].join("\r\n");
+    } else {
+      mime = [...headers, ...textPart("text/plain", input.body)].join("\r\n");
+    }
+
+    return {
+      raw: Buffer.from(mime, "utf8").toString("base64url"),
+      threadId,
+      meta: { to, cc, bcc, subject },
+    };
+  }
+
+  // -----------------------------------------------------------------------
   // batch_process — fetch structured data for Claude to decide on
   // -----------------------------------------------------------------------
 
@@ -405,4 +560,52 @@ export class GmailService {
     }
     return [...new Set(links)];
   }
+}
+
+// ---------------------------------------------------------------------------
+// MIME helpers for compose
+// ---------------------------------------------------------------------------
+
+function clean(list?: string[]): string[] {
+  return (list ?? []).flatMap(splitAddresses);
+}
+
+/** Splits "a@x.com, \"Doe, Jane\" <j@y.com>" on commas outside quotes and angle brackets. */
+function splitAddresses(value: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quoted = false;
+  let angle = false;
+  for (const ch of value) {
+    if (ch === '"') quoted = !quoted;
+    else if (ch === "<") angle = true;
+    else if (ch === ">") angle = false;
+    if (ch === "," && !quoted && !angle) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = "";
+    } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+function bareAddress(a: string): string {
+  return (/<([^>]+)>/.exec(a)?.[1] ?? a).trim().toLowerCase();
+}
+
+/** RFC 2047 encoding, only when the subject is not plain ASCII. */
+function encodeHeader(value: string): string {
+  return /^[\x20-\x7e]*$/.test(value)
+    ? value
+    : `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+function textPart(type: "text/plain" | "text/html", content: string): string[] {
+  const b64 = Buffer.from(content, "utf8").toString("base64").replace(/.{76}/g, "$&\r\n");
+  return [
+    `Content-Type: ${type}; charset="UTF-8"`,
+    "Content-Transfer-Encoding: base64",
+    "",
+    b64,
+  ];
 }

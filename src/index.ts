@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { google } from "googleapis";
 import { z } from "zod";
+import { timingSafeEqual } from "node:crypto";
 import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
 
@@ -15,6 +16,9 @@ const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
+// The MCP endpoint lives at /mcp/<MCP_SECRET>. Claude custom connectors cannot
+// send a header, so the secret in the path is what keeps the mailbox private.
+const MCP_SECRET = process.env.MCP_SECRET!;
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
@@ -275,6 +279,118 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ---- compose fields shared by create_draft and send_email ----
+  const addressList = z
+    .array(z.string())
+    .optional();
+  const composeFields = {
+    account: z
+      .string()
+      .describe("Email address of the connected account to write from (not 'all')"),
+    to: addressList.describe(
+      "Recipients, e.g. ['jane@example.com', 'Bob <bob@example.com>']. Optional when replying: defaults to the original sender."
+    ),
+    cc: addressList.describe("Cc recipients"),
+    bcc: addressList.describe("Bcc recipients"),
+    subject: z
+      .string()
+      .optional()
+      .describe("Subject line. Optional when replying: defaults to 'Re: <original subject>'."),
+    body: z.string().describe("Plain text body"),
+    html_body: z
+      .string()
+      .optional()
+      .describe("Optional HTML version of the body. The plain text body is still sent as the fallback."),
+    reply_to_message_id: z
+      .string()
+      .optional()
+      .describe("Gmail message ID to reply to. Keeps the message in the same thread with proper reply headers."),
+    reply_all: z
+      .boolean()
+      .default(false)
+      .describe("When replying without 'to', also include the original To and Cc recipients (except yourself)."),
+  };
+
+  const toCompose = (a: any) => ({
+    to: a.to,
+    cc: a.cc,
+    bcc: a.bcc,
+    subject: a.subject,
+    body: a.body,
+    htmlBody: a.html_body,
+    replyToMessageId: a.reply_to_message_id,
+    replyAll: a.reply_all,
+  });
+
+  const singleAccount = (account: string) => {
+    if (account.toLowerCase() === "all") {
+      throw new Error("Pick one account to write from; 'all' is only for reading.");
+    }
+    return resolveAccounts(account)[0];
+  };
+
+  // ---- create_draft ----
+  server.tool(
+    "create_draft",
+    "Create a draft email in a connected Gmail account. Nothing is sent. The draft appears in that account's Drafts folder, where it can be reviewed, edited or sent (also with send_email and draft_id). Supports replies in a thread via reply_to_message_id.",
+    composeFields,
+    async (args) => {
+      const email = singleAccount(args.account);
+      const gmail = await getGmailServiceForAccount(email);
+      const draft = await gmail.createDraft(toCompose(args));
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account: email, status: "draft_created", ...draft }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- send_email ----
+  server.tool(
+    "send_email",
+    "Send an email from a connected Gmail account. This delivers immediately and cannot be undone. Either compose a new message (to, subject, body) or pass draft_id to send an existing draft as saved. Supports replies in a thread via reply_to_message_id.",
+    {
+      ...composeFields,
+      body: z
+        .string()
+        .optional()
+        .describe("Plain text body. Required unless draft_id is given."),
+      draft_id: z
+        .string()
+        .optional()
+        .describe("Send this existing draft exactly as saved. When set, all other compose fields must be left out."),
+    },
+    async (args) => {
+      const email = singleAccount(args.account);
+      const gmail = await getGmailServiceForAccount(email);
+      let sent;
+      if (args.draft_id) {
+        const composed = ["to", "cc", "bcc", "subject", "body", "html_body", "reply_to_message_id"].filter(
+          (k) => (args as any)[k] !== undefined
+        );
+        if (composed.length) {
+          throw new Error(`draft_id sends the draft as saved; remove ${composed.join(", ")} or edit the draft first.`);
+        }
+        sent = await gmail.sendDraft(args.draft_id);
+      } else {
+        if (args.body === undefined) throw new Error("body is required when not sending a draft.");
+        sent = await gmail.sendEmail(toCompose(args));
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account: email, status: "sent", ...sent }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
   // ---- batch_process ----
   server.tool(
     "batch_process",
@@ -341,6 +457,27 @@ function createMcpServer(): McpServer {
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Serverless instances do not share memory, so read the accounts fresh.
+app.use(async (_req, _res, next) => {
+  try {
+    await tokenStore.refresh();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function secretMatches(given: string | undefined): boolean {
+  if (!MCP_SECRET || !given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(MCP_SECRET);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 // ---------------------------------------------------------------------------
 // Admin auth middleware for /setup routes
@@ -412,23 +549,15 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
     </head>
     <body>
       <h1>Gmail MCP Server — Setup</h1>
-      ${message ? `<div class="msg">${message}</div>` : ""}
+      ${message ? `<div class="msg">${escapeHtml(message)}</div>` : ""}
       <table>
         <thead><tr><th>Account</th><th>Added</th><th></th></tr></thead>
         <tbody>${accountRows}</tbody>
       </table>
       <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
-      ${accounts.length > 0 ? `
-      <div style="margin-top:24px;padding:16px;background:#fff3cd;border-radius:6px">
-        <strong>Important:</strong> After adding/removing accounts, copy the value below and paste it as the <code>TOKENS_DATA</code> environment variable in Railway. This ensures accounts survive redeploys.
-        <div style="margin-top:8px">
-          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${tokenStore.getTokensDataForExport()}</textarea>
-        </div>
-      </div>
-      ` : ""}
       <hr style="margin-top:40px;border:none;border-top:1px solid #eee" />
       <p style="color:#888;font-size:13px">
-        MCP endpoint: <code>${SERVER_URL}/mcp</code><br/>
+        MCP endpoint: <code>${SERVER_URL}/mcp/${MCP_SECRET}</code><br/>
         Connected accounts: ${accounts.length}
       </p>
     </body>
@@ -436,12 +565,12 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
   `);
 });
 
-app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
+app.post("/setup/remove", requireAdmin, async (req: Request, res: Response) => {
   const email = req.body.email;
   const key = req.query.key as string;
 
   if (email && tokenStore.hasAccount(email)) {
-    tokenStore.removeAccount(email);
+    await tokenStore.removeAccount(email);
     res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
   } else {
     res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
@@ -513,7 +642,7 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
       return;
     }
 
-    tokenStore.addAccount(email, tokens.refresh_token);
+    await tokenStore.addAccount(email, tokens.refresh_token);
 
     res.redirect(
       `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Successfully connected ${email}`)}`
@@ -541,7 +670,11 @@ app.get("/health", (_req, res) => {
 // MCP transport — Streamable HTTP (stateless: each request gets a fresh server)
 // ---------------------------------------------------------------------------
 
-app.post("/mcp", async (req: Request, res: Response) => {
+app.post("/mcp/:secret", async (req: Request, res: Response) => {
+  if (!secretMatches(req.params.secret as string)) {
+    res.status(404).send("Not found");
+    return;
+  }
   try {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless — no session tracking
@@ -569,7 +702,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp/:secret", async (req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "SSE streams not supported in stateless mode. Use POST." },
@@ -577,7 +710,7 @@ app.get("/mcp", async (req: Request, res: Response) => {
   });
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete("/mcp/:secret", async (req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "Session management not used in stateless mode." },
@@ -589,9 +722,12 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 // Start
 // ---------------------------------------------------------------------------
 
-app.listen(PORT, () => {
+export default app;
+
+// Vercel imports the app; anywhere else, listen as before.
+if (!process.env.VERCEL) app.listen(PORT, () => {
   console.log(`Gmail MCP server listening on port ${PORT}`);
-  console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
+  console.log(`  MCP endpoint:  ${SERVER_URL}/mcp/<MCP_SECRET>`);
   console.log(`  Setup page:    ${SERVER_URL}/setup`);
   console.log(`  Health check:  ${SERVER_URL}/health`);
   console.log(`  Accounts:      ${tokenStore.size}`);

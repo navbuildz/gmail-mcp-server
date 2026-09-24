@@ -52,7 +52,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 - **Auto-unsubscribe.** Finds and triggers unsubscribe links automatically. Supports List-Unsubscribe headers, mailto links, and body link scanning.
 - **Batch operations.** Fetch batches of emails for AI-powered triage and bulk actions.
 - **Secure by design.** OAuth 2.0 authentication, AES-256-GCM encrypted token storage, minimal Gmail scopes.
-- **Deploy anywhere.** Railway, Docker, or your own server.
+- **Deploy anywhere.** Vercel (free), Railway, Docker, or your own server.
 
 ---
 
@@ -65,6 +65,8 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `get_email` | Get full email content, headers, and parsed unsubscribe links |
 | `archive_email` | Archive an email by removing it from the inbox |
 | `apply_label` | Apply a label to an email. Creates the label if it doesn't exist |
+| `create_draft` | Create a draft (new or a reply in the thread). Nothing is sent |
+| `send_email` | Send a new email or reply, or send an existing draft by `draft_id` |
 | `unsubscribe_email` | Auto-unsubscribe from mailing lists and newsletters |
 | `batch_process` | Fetch a batch of emails for triage. Supports `account="all"` |
 
@@ -94,7 +96,15 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 
 ### Step 2: Deploy
 
-#### Option A: Deploy to Railway (Recommended)
+#### Option A: Deploy to Vercel (free)
+
+1. Import this repo in Vercel. `vercel.json` sets the Express preset
+2. In the project, go to **Storage** and add **Upstash for Redis** (free plan). This sets `KV_REST_API_URL` and `KV_REST_API_TOKEN`, which is where connected accounts are saved (Vercel's disk does not persist)
+3. Add the environment variables from the table below, with `SERVER_URL` set to `https://<project>.vercel.app` and no `PORT`
+4. Add `https://<project>.vercel.app/oauth/callback` as an **Authorized redirect URI** in Google Cloud Console
+5. Deploy
+
+#### Option B: Deploy to Railway
 
 1. Click the Deploy button above, or create a new project on [Railway](https://railway.app) connected to this repo
 2. Add these environment variables:
@@ -105,14 +115,15 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `GOOGLE_CLIENT_SECRET` | Your OAuth Client Secret |
 | `ENCRYPTION_KEY` | Any random string (32+ characters) |
 | `ADMIN_PASSWORD` | Password for the setup page |
-| `SERVER_URL` | Your Railway app URL (e.g., `https://your-app.railway.app`) |
+| `MCP_SECRET` | A long random string (`openssl rand -hex 24`). The MCP endpoint is `/mcp/<MCP_SECRET>`; without it every MCP request returns 404 |
+| `SERVER_URL` | Your app URL (e.g., `https://your-app.railway.app`) |
 | `PORT` | `3000` |
 
 3. Generate a domain in Railway (Service → Settings → Networking → Generate Domain)
 4. Update `SERVER_URL` with the generated domain
 5. Update the **Authorized redirect URI** in Google Cloud Console to `https://your-domain.railway.app/oauth/callback`
 
-#### Option B: Self-Host
+#### Option C: Self-Host
 
 ```bash
 git clone https://github.com/navbuildz/gmail-mcp-server.git
@@ -124,7 +135,7 @@ npm run build
 npm start
 ```
 
-#### Option C: Docker
+#### Option D: Docker
 
 ```bash
 docker build -t gmail-mcp-server .
@@ -145,7 +156,7 @@ docker run -p 3000:3000 \
 4. Sign in with Google and grant permissions
 5. Repeat for each Gmail account you want to connect
 
-> **Railway users:** After adding accounts, copy the `TOKENS_DATA` value shown on the setup page and add it as an environment variable in Railway. This keeps your accounts connected across redeploys.
+> **Railway users without Redis:** After adding accounts, copy the `TOKENS_DATA=` value from the server logs and add it as an environment variable in Railway. This keeps your accounts connected across redeploys.
 
 ---
 
@@ -155,7 +166,7 @@ docker run -p 3000:3000 \
 2. Click **+** → Add custom connector
 3. Fill in:
    - **Name**: `Gmail` (or any name you prefer)
-   - **Remote MCP server URL**: `https://your-server-url/mcp`
+   - **Remote MCP server URL**: `https://your-server-url/mcp/<MCP_SECRET>` (choose "No sign-in"; the secret in the path is the credential)
    - Leave OAuth fields blank
 4. Click **Add**
 5. Start a new conversation and try: *"List my connected Gmail accounts"*
@@ -170,7 +181,7 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
 {
   "mcpServers": {
     "gmail": {
-      "url": "https://your-server-url/mcp"
+      "url": "https://your-server-url/mcp/<MCP_SECRET>"
     }
   }
 }
@@ -186,7 +197,7 @@ Add to your Windsurf MCP configuration:
 {
   "mcpServers": {
     "gmail": {
-      "serverUrl": "https://your-server-url/mcp"
+      "serverUrl": "https://your-server-url/mcp/<MCP_SECRET>"
     }
   }
 }
@@ -233,7 +244,7 @@ Try it: *"Find newsletters from the last month and unsubscribe from all of them"
 | [Windsurf](https://codeium.com/windsurf) | Supported | MCP configuration |
 | [Cline](https://github.com/cline/cline) | Supported | MCP settings |
 | [Continue](https://continue.dev) | Supported | MCP configuration |
-| Any MCP-compatible client | Supported | Point to the `/mcp` endpoint |
+| Any MCP-compatible client | Supported | Point to the `/mcp/<MCP_SECRET>` endpoint |
 
 ---
 
@@ -242,11 +253,11 @@ Try it: *"Find newsletters from the last month and unsubscribe from all of them"
 ```
 AI Agent / Assistant (Claude, OpenClaw, Cursor, Windsurf, Cline)
   ↓ MCP Protocol (Streamable HTTP)
-Gmail MCP Server (Railway / Self-hosted / Docker)
-  ├── /mcp             MCP endpoint (tools)
+Gmail MCP Server (Vercel / Railway / Self-hosted / Docker)
+  ├── /mcp/<secret>    MCP endpoint (tools)
   ├── /setup           Admin page (add/remove accounts)
   ├── /oauth/callback  Google OAuth callback
-  └── Token Store      Encrypted refresh tokens
+  └── Token Store      Encrypted refresh tokens (Upstash Redis, or a file)
         ↓
 Gmail API (per-account OAuth tokens)
 ```
@@ -259,6 +270,8 @@ Gmail API (per-account OAuth tokens)
 - **AES-256-GCM** encrypted refresh token storage
 - **Minimal scopes** using only `gmail.readonly` and `gmail.modify`
 - **No passwords stored.** Your Gmail password never touches the server
+- **Secret MCP endpoint.** `/mcp/<MCP_SECRET>` is the only way in; anyone with that URL can use every tool, so treat it like a password
+- **Sending is explicit.** `create_draft` never sends; `send_email` does, immediately. Set `send_email` to require approval in your MCP client if you want a confirmation step
 - **Password-protected setup.** The `/setup` page requires admin authentication
 - **Revocable anytime** from [Google Account Permissions](https://myaccount.google.com/permissions)
 

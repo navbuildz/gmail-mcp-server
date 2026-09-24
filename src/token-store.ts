@@ -6,11 +6,13 @@ import {
 } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { Redis } from "@upstash/redis";
 
 // ---------------------------------------------------------------------------
 // Encrypted token store
 //
 // Persistence strategy (in priority order):
+// 0. Upstash Redis, when its env vars are set (Vercel: the disk does not persist)
 // 1. File on disk (works if volume is mounted or running locally)
 // 2. TOKENS_DATA env var (base64-encoded JSON — survives Railway redeploys)
 //
@@ -73,11 +75,27 @@ function decrypt(blob: string): string {
   ]).toString("utf8");
 }
 
+const REDIS_KEY = "gmail-mcp:accounts";
+
+function redisClient(): Redis | null {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  return url && token ? new Redis({ url, token }) : null;
+}
+
 export class TokenStore {
   private accounts = new Map<string, StoredAccount>();
+  private redis = redisClient();
 
   constructor() {
-    this.load();
+    if (!this.redis) this.load();
+  }
+
+  /** Re-reads Redis so every serverless instance sees accounts added by another. */
+  async refresh(): Promise<void> {
+    if (!this.redis) return;
+    const raw = await this.redis.get<StoreData>(REDIS_KEY);
+    this.accounts = new Map((raw?.accounts ?? []).map((a) => [a.email, a]));
   }
 
   private load(): void {
@@ -137,7 +155,13 @@ export class TokenStore {
     }
   }
 
-  private save(): void {
+  private async save(): Promise<void> {
+    if (this.redis) {
+      await this.redis.set(REDIS_KEY, {
+        accounts: Array.from(this.accounts.values()),
+      } satisfies StoreData);
+      return;
+    }
     this.saveToFile();
 
     // Also output the base64-encoded data for the TOKENS_DATA env var
@@ -152,20 +176,20 @@ export class TokenStore {
     return Buffer.from(JSON.stringify(data)).toString("base64");
   }
 
-  addAccount(email: string, refreshToken: string): void {
+  async addAccount(email: string, refreshToken: string): Promise<void> {
     this.accounts.set(email, {
       email,
       refreshToken: encrypt(refreshToken),
       addedAt: new Date().toISOString(),
     });
-    this.save();
+    await this.save();
     console.log(`[token-store] Added account: ${email}`);
   }
 
-  removeAccount(email: string): boolean {
+  async removeAccount(email: string): Promise<boolean> {
     const deleted = this.accounts.delete(email);
     if (deleted) {
-      this.save();
+      await this.save();
       console.log(`[token-store] Removed account: ${email}`);
     }
     return deleted;
