@@ -51,10 +51,22 @@ export interface ComposeResult {
   subject: string;
 }
 
+export interface UnsubscribeAttempt {
+  method: "one-click-post" | "mailto";
+  target: string;
+  ok: boolean;
+  status?: number;
+  note?: string;
+}
+
 export interface UnsubscribeResult {
+  /** True only when the sender accepted a machine unsubscribe (one-click 2xx) or the mailto was sent. */
   success: boolean;
-  method: "header-mailto" | "header-http" | "body-link" | "none";
+  status: "confirmed" | "sent" | "needs_manual_click" | "failed";
+  method: "one-click-post" | "header-mailto" | "none";
   detail: string;
+  attempts: UnsubscribeAttempt[];
+  manualLinks?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -220,120 +232,90 @@ export class GmailService {
 
   async unsubscribeEmail(messageId: string): Promise<UnsubscribeResult> {
     const email = await this.getEmail(messageId);
-    const listUnsubscribe = email.headers["List-Unsubscribe"] ?? "";
+    const hdr = (name: string) =>
+      Object.entries(email.headers).find(
+        ([k]) => k.toLowerCase() === name.toLowerCase()
+      )?.[1] ?? "";
+    const parsed = parseListUnsubscribe(hdr("List-Unsubscribe"));
+    const oneClick = /list-unsubscribe\s*=\s*one-click/i.test(
+      hdr("List-Unsubscribe-Post")
+    );
+    const attempts: UnsubscribeAttempt[] = [];
+    const bodyLinks = this.extractUnsubscribeLinksFromBody(email.body);
+    const manualLinks = [...new Set([...parsed.https, ...parsed.http, ...bodyLinks])];
 
-    // 1. Try HTTP link from List-Unsubscribe header
-    const httpLinks = this.extractHttpLinks(listUnsubscribe);
-    for (const link of httpLinks) {
-      try {
-        const resp = await fetch(link, {
-          method: "GET",
-          redirect: "follow",
-          signal: AbortSignal.timeout(10000),
-        });
-        if (resp.ok) {
+    // 1. RFC 8058 one-click: the only HTTP method that actually unsubscribes
+    //    without a human. Must be POST, https, body "List-Unsubscribe=One-Click".
+    if (oneClick) {
+      for (const link of parsed.https) {
+        const a = await httpAttempt(link, "POST");
+        attempts.push(a);
+        if (a.status !== undefined && a.status >= 200 && a.status < 300) {
           return {
             success: true,
-            method: "header-http",
-            detail: `Successfully requested unsubscribe via header link: ${link}`,
+            status: "confirmed",
+            method: "one-click-post",
+            detail: `RFC 8058 one-click POST accepted (HTTP ${a.status}) by ${link}`,
+            attempts,
           };
         }
-      } catch {
-        // Try next link
       }
     }
 
-    // 2. Try POST to List-Unsubscribe with List-Unsubscribe-Post header
-    const postHeader = email.headers["List-Unsubscribe-Post"];
-    if (postHeader && httpLinks.length > 0) {
-      for (const link of httpLinks) {
-        try {
-          const resp = await fetch(link, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: postHeader,
-            redirect: "follow",
-            signal: AbortSignal.timeout(10000),
-          });
-          if (resp.ok) {
-            return {
-              success: true,
-              method: "header-http",
-              detail: `Successfully POSTed unsubscribe via RFC 8058: ${link}`,
-            };
-          }
-        } catch {
-          // Try next
-        }
-      }
-    }
-
-    // 3. Try mailto from List-Unsubscribe header
-    const mailtoMatch = listUnsubscribe.match(/mailto:([^>,\s]+)/i);
-    if (mailtoMatch) {
-      const mailtoAddr = mailtoMatch[1];
+    // 2. mailto: actually send the request from the account that received it.
+    if (parsed.mailto) {
       try {
-        await this.sendUnsubscribeMail(mailtoAddr);
+        const { to, subject, body } = parseMailto(parsed.mailto);
+        const sent = await this.sendUnsubscribeMail(to, subject, body);
+        attempts.push({ method: "mailto", target: to, ok: true, note: `sent message ${sent}` });
         return {
           success: true,
+          status: "sent",
           method: "header-mailto",
-          detail: `Sent unsubscribe email to ${mailtoAddr}`,
+          detail: `Unsubscribe email sent to ${to} (Gmail message ${sent}). Processing is up to the sender, often a few days.`,
+          attempts,
         };
       } catch (err) {
-        // Fall through
+        attempts.push({ method: "mailto", target: parsed.mailto, ok: false, note: errMsg(err) });
       }
     }
 
-    // 4. Scan body for unsubscribe links
-    const bodyLinks = this.extractUnsubscribeLinksFromBody(email.body);
-    for (const link of bodyLinks) {
-      try {
-        const resp = await fetch(link, {
-          method: "GET",
-          redirect: "follow",
-          signal: AbortSignal.timeout(10000),
-        });
-        if (resp.ok) {
-          return {
-            success: true,
-            method: "body-link",
-            detail: `Visited unsubscribe link found in email body: ${link}`,
-          };
-        }
-      } catch {
-        // Try next
-      }
-    }
-
-    // 5. Nothing worked — return the links we found so Claude can inform the user
-    const allLinks = [...httpLinks, ...bodyLinks];
+    // 3. No machine-actionable method. A GET only opens a landing page that
+    //    usually needs a click, so we never claim success for it.
     return {
       success: false,
+      status: manualLinks.length > 0 ? "needs_manual_click" : "failed",
       method: "none",
       detail:
-        allLinks.length > 0
-          ? `Could not auto-unsubscribe. Found these links the user can try manually:\n${allLinks.join("\n")}`
+        manualLinks.length > 0
+          ? `No one-click or working mailto unsubscribe. Open one of these and confirm manually:\n${manualLinks.join("\n")}`
           : "No unsubscribe mechanism found in this email.",
+      attempts,
+      manualLinks,
     };
   }
 
-  private async sendUnsubscribeMail(toAddress: string): Promise<void> {
-    // Compose a minimal unsubscribe email
+  private async sendUnsubscribeMail(
+    toAddress: string,
+    subject = "Unsubscribe",
+    body = "Unsubscribe"
+  ): Promise<string> {
     const raw = Buffer.from(
       [
         `To: ${toAddress}`,
-        `Subject: Unsubscribe`,
+        `Subject: ${encodeHeader(subject)}`,
         `Content-Type: text/plain; charset="UTF-8"`,
         "",
-        "Unsubscribe",
+        body,
       ].join("\r\n")
-    )
-      .toString("base64url");
+    ).toString("base64url");
 
-    await this.gmail.users.messages.send({
+    const res = await this.gmail.users.messages.send({
       userId: "me",
       requestBody: { raw },
     });
+    if (!res.data.id) throw new Error("Gmail send returned no message id");
+    return res.data.id;
   }
 
   // -----------------------------------------------------------------------
@@ -608,4 +590,62 @@ function textPart(type: "text/plain" | "text/html", content: string): string[] {
     "",
     b64,
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Unsubscribe helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+/** Parses "<https://a>, <mailto:b?subject=x>" into its parts (RFC 2369). */
+export function parseListUnsubscribe(value: string): {
+  https: string[];
+  http: string[];
+  mailto?: string;
+} {
+  const items = [...value.matchAll(/<([^>]+)>/g)].map((m) => m[1].trim());
+  if (items.length === 0 && value.trim()) items.push(...value.split(",").map((x) => x.trim()));
+  return {
+    https: items.filter((u) => /^https:\/\//i.test(u)),
+    http: items.filter((u) => /^http:\/\//i.test(u)),
+    mailto: items.find((u) => /^mailto:/i.test(u)),
+  };
+}
+
+/** Splits mailto:addr?subject=..&body=.. into its parts. */
+export function parseMailto(uri: string): { to: string; subject: string; body: string } {
+  const rest = uri.replace(/^mailto:/i, "");
+  const [addr, query = ""] = rest.split("?");
+  const params = new URLSearchParams(query);
+  const get = (k: string) =>
+    [...params.entries()].find(([n]) => n.toLowerCase() === k)?.[1];
+  return {
+    to: decodeURIComponent(addr),
+    subject: get("subject") || "Unsubscribe",
+    body: get("body") || "Unsubscribe",
+  };
+}
+
+async function httpAttempt(link: string, method: "POST"): Promise<UnsubscribeAttempt> {
+  try {
+    const resp = await fetch(link, {
+      method,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "List-Unsubscribe=One-Click",
+      // RFC 8058: do not follow redirects; a 3xx is not an acceptance.
+      redirect: "manual",
+      signal: AbortSignal.timeout(8000),
+    });
+    return {
+      method: "one-click-post",
+      target: link,
+      ok: resp.status >= 200 && resp.status < 300,
+      status: resp.status,
+    };
+  } catch (err) {
+    return { method: "one-click-post", target: link, ok: false, note: errMsg(err) };
+  }
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

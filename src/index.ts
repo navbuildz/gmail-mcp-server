@@ -256,7 +256,7 @@ function createMcpServer(): McpServer {
   // ---- unsubscribe_email ----
   server.tool(
     "unsubscribe_email",
-    "Attempt to unsubscribe from a mailing list. Tries List-Unsubscribe header (HTTP and mailto), then scans the email body for unsubscribe links.",
+    "Unsubscribe from a mailing list. Uses RFC 8058 one-click POST when offered, else sends the List-Unsubscribe mailto from this account. Returns status: confirmed | sent | needs_manual_click (links in manualLinks) | failed. Only confirmed/sent count as done.",
     {
       account: z
         .string()
