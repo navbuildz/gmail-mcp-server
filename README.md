@@ -1,6 +1,6 @@
 # Multi-account Gmail MCP Server
 
-### Multi-Account Gmail for AI Agents & Assistants
+### Gmail for AI Agents & Assistants
 
 An open-source [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gives AI agents and assistants full read and write access to Gmail. Connect multiple Gmail accounts, search emails, archive, label, and auto-unsubscribe. All through one server.
 
