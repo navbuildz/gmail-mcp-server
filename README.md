@@ -14,7 +14,7 @@ Works with **Claude**, **OpenClaw**, **Cursor**, **Windsurf**, **Cline**, **Cont
 
 ## Why This Exists
 
-Most AI tools ship with a Gmail integration that can only read emails from a single account. No archiving. No labeling. No unsubscribing. And if you use multiple Gmail accounts? You're out of luck.
+Most AI tools ship with a Gmail integration tied to a single account, with no way to unsubscribe, and they only work inside one app. If you use multiple Gmail accounts, or want the same email tools in Claude, Cursor and your own agents, you're out of luck.
 
 This MCP server fixes that. One server, all your accounts, full read and write access.
 
@@ -22,17 +22,13 @@ This MCP server fixes that. One server, all your accounts, full read and write a
 
 | Feature | Built-in Gmail (Claude) | Gmail MCP Server |
 |---|---|---|
-| Read emails | Yes | Yes |
-| Write / modify emails | No | **Yes** |
-| Multiple Gmail accounts | No | **Yes** |
-| Archive emails | No | **Yes** |
-| Apply labels | No | **Yes** |
-| Auto-unsubscribe | No | **Yes** |
-| Works with OpenClaw | No | **Yes** |
-| Works with Cursor | No | **Yes** |
-| Works with Windsurf | No | **Yes** |
-| Works with Cline | No | **Yes** |
-| Open source | No | **Yes** |
+| Read and search emails | Yes | Yes |
+| Drafts, send, labels | Yes | Yes |
+| Multiple Gmail accounts at once | No | **Yes** |
+| Search across all accounts in one call | No | **Yes** |
+| Unsubscribe (RFC 8058 one-click + mailto) | No | **Yes** |
+| Works with OpenClaw, Cursor, Windsurf, Cline | No | **Yes** |
+| Self-hosted, open source | No | **Yes** |
 
 ---
 
@@ -46,10 +42,10 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 
 ## Gmail MCP Server Features
 
-- **Multi-account support.** Connect multiple Gmail accounts and switch between them, or query all at once.
-- **Full read and write access.** Not just reading emails. Archive, label, modify, and unsubscribe.
+- **Multi-account support.** Connect multiple Gmail accounts and pick one per call, or search all of them at once.
+- **Full read and write access.** Not just reading emails. Archive, label, draft, send, and unsubscribe.
 - **Gmail search syntax.** Use Gmail's query language: `is:unread`, `from:`, `newer_than:7d`, `has:attachment`, and more.
-- **Auto-unsubscribe.** Finds and triggers unsubscribe links automatically. Supports List-Unsubscribe headers, mailto links, and body link scanning.
+- **Honest unsubscribe.** Uses the RFC 8058 one-click POST or sends the `mailto:` request from the right account, and only reports success when the sender accepted it. Anything that needs a human click comes back as a link to open.
 - **Batch operations.** Fetch batches of emails for AI-powered triage and bulk actions.
 - **Secure by design.** OAuth 2.0 authentication, AES-256-GCM encrypted token storage, minimal Gmail scopes.
 - **Deploy anywhere.** Vercel (free), Railway, Docker, or your own server.
@@ -67,7 +63,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `apply_label` | Apply a label to an email. Creates the label if it doesn't exist |
 | `create_draft` | Create a draft (new or a reply in the thread). Nothing is sent |
 | `send_email` | Send a new email or reply, or send an existing draft by `draft_id` |
-| `unsubscribe_email` | Auto-unsubscribe from mailing lists and newsletters |
+| `unsubscribe_email` | Unsubscribe from a mailing list (one-click POST or mailto), or return the link to click |
 | `batch_process` | Fetch a batch of emails for triage. Supports `account="all"` |
 
 ---
@@ -144,6 +140,7 @@ docker run -p 3000:3000 \
   -e GOOGLE_CLIENT_SECRET=your-client-secret \
   -e ENCRYPTION_KEY=your-random-string \
   -e ADMIN_PASSWORD=your-password \
+  -e MCP_SECRET=your-long-random-secret \
   -e SERVER_URL=https://your-domain.com \
   gmail-mcp-server
 ```
@@ -207,28 +204,28 @@ Add to your Windsurf MCP configuration:
 
 ## Multi-Account Gmail Setup
 
-Connect as many Gmail accounts as you need. Every tool accepts an `account` parameter:
+Connect as many Gmail accounts as you need. Every tool takes an `account` parameter:
 
 - Use a specific email: `"account": "user@gmail.com"`
-- Query all accounts at once: `"account": "all"`
+- Search all accounts at once: `"account": "all"` (`list_emails` and `batch_process` only; tools that change or send mail act on one account at a time)
 
 **Example prompts you can try:**
 - *"Show me unread emails from the last 2 days across all accounts"*
 - *"Archive all promotional emails in user@gmail.com"*
-- *"Unsubscribe from newsletters in all accounts"*
+- *"Find newsletters in each of my accounts and unsubscribe"*
 - *"Find emails with attachments from the last week in work@gmail.com"*
 
 ---
 
-## Auto-Unsubscribe from Newsletters with AI
+## Unsubscribe from Newsletters with AI
 
-The `unsubscribe_email` tool handles the entire unsubscribe process:
+The `unsubscribe_email` tool tries, in order:
 
-1. Checks the `List-Unsubscribe` header (RFC 8058 one-click POST)
-2. Tries HTTP unsubscribe links from the header
-3. Sends an unsubscribe email via `mailto:` links
-4. Scans the email body for unsubscribe URLs
-5. Returns manual links if automatic unsubscribe isn't possible
+1. **One-click POST** ([RFC 8058](https://datatracker.ietf.org/doc/html/rfc8058)) when the email has `List-Unsubscribe` plus `List-Unsubscribe-Post`. A 2xx response counts as confirmed.
+2. **mailto:** sends the unsubscribe email from the account that received the newsletter.
+3. **Manual links.** If neither works, it returns the unsubscribe links (from the header and the body) for you to open. It never opens a link and calls that success, because most landing pages still need a click.
+
+Every call returns a `status`: `confirmed` (one-click accepted), `sent` (mailto sent), `needs_manual_click` (links returned), or `failed` (no unsubscribe mechanism found).
 
 Try it: *"Find newsletters from the last month and unsubscribe from all of them"*
 
@@ -268,7 +265,7 @@ Gmail API (per-account OAuth tokens)
 
 - **OAuth 2.0** for authentication with Google
 - **AES-256-GCM** encrypted refresh token storage
-- **Minimal scopes** using only `gmail.readonly` and `gmail.modify`
+- **Scopes:** `gmail.readonly`, `gmail.modify` (which also covers drafts and sending) and `userinfo.email` (to know which account was connected). No full `mail.google.com` access, so nothing is ever permanently deleted
 - **No passwords stored.** Your Gmail password never touches the server
 - **Secret MCP endpoint.** `/mcp/<MCP_SECRET>` is the only way in; anyone with that URL can use every tool, so treat it like a password
 - **Sending is explicit.** `create_draft` never sends; `send_email` does, immediately. Set `send_email` to require approval in your MCP client if you want a confirmation step
@@ -300,8 +297,6 @@ The `list_emails` and `batch_process` tools accept Gmail's full search syntax:
 
 Want to help make this better? Here are some open ideas:
 
-- [ ] Add `send_email` tool for composing and sending emails
-- [ ] Add `reply_to_email` tool
 - [ ] Add email attachment download support
 - [ ] Add `delete_email` tool
 - [ ] Add `mark_as_read` / `mark_as_unread` tools
