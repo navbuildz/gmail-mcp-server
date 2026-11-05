@@ -1,4 +1,4 @@
-# Gmail MCP Server
+# Multi-account Gmail MCP Server
 
 ### Multi-Account Gmail for AI Agents & Assistants
 
